@@ -1,0 +1,251 @@
+from flask import Flask, render_template_string, request, redirect, session, send_file, jsonify
+from scapy.all import sniff, IP, TCP, UDP, ICMP
+import sqlite3, threading, csv, smtplib, requests, os
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# PDF Libraries
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+
+app = Flask(__name__)
+app.secret_key = "hexashield_presentation_final"
+
+# ---------------- CONFIGURATION ----------------
+DB_PATH = 'hexashield.db'
+target_email = "" # This will be updated via the UI
+
+# !!! STEP 1: PUT YOUR DETAILS HERE !!!
+SENDER_EMAIL = "your-email@gmail.com"  
+SENDER_PASSWORD = "your-app-password" # 16-character App Password
+
+def init_db():
+    # If you get "no such column" errors, delete the .db file and restart
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS alerts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                type TEXT, message TEXT, ip TEXT,
+                country TEXT, severity TEXT, protocol TEXT
+            )
+        """)
+init_db()
+
+# ---------------- ENGINES ----------------
+geo_cache = {}
+def get_geo(ip):
+    if ip in geo_cache: return geo_cache[ip]
+    try:
+        # Fetching Country only to keep it fast
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=country", timeout=1).json()
+        country = r.get('country', 'Local/Unknown')
+        geo_cache[ip] = country
+        return country
+    except: return "Discovery"
+
+def send_mail(t, ip, loc):
+    global target_email
+    if not target_email or not SENDER_PASSWORD: return
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = target_email
+        msg['Subject'] = f"🚨 HexaShield ALERT: {t} Detected"
+       
+        body = f"Intrusion Detection System Alert\n\nType: {t}\nSource IP: {ip}\nLocation: {loc}\n\nCheck your dashboard for details."
+        msg.attach(MIMEText(body, 'plain'))
+
+        s = smtplib.SMTP("smtp.gmail.com", 587)
+        s.starttls()
+        s.login(SENDER_EMAIL, SENDER_PASSWORD)
+        s.send_message(msg)
+        s.quit()
+        print(f"Alert sent to {target_email}")
+    except Exception as e:
+        print(f"Mail Error: {e}")
+
+def log_event(t, msg, ip, proto):
+    sev = "HIGH" if any(x in t for x in ["Scan", "Attack", "Flood"]) else "MEDIUM"
+    loc = get_geo(ip)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO alerts (type, message, ip, country, severity, protocol) VALUES (?,?,?,?,?,?)",
+                    (t, msg, ip, loc, sev, proto))
+   
+    # Send email ONLY for High severity alerts
+    if sev == "HIGH":
+        threading.Thread(target=send_mail, args=(t, ip, loc)).start()
+
+def packet_hunter(pkt):
+    if not pkt.haslayer(IP): return
+    src = pkt[IP].src
+    if pkt.haslayer(TCP):
+        f = pkt[TCP].flags
+        p = pkt[TCP].dport
+        if f == 0: log_event("NULL Scan", f"Target Port {p}", src, "TCP")
+        elif f & 0x29: log_event("XMAS Scan", f"Target Port {p}", src, "TCP")
+        elif p in [80, 443]: log_event("Web Traffic", "HTTP/S Protocol", src, "WEB")
+        else: log_event("TCP Traffic", f"Port {p}", src, "TCP")
+    elif pkt.haslayer(UDP): log_event("UDP Data", f"Port {pkt[UDP].dport}", src, "UDP")
+    elif pkt.haslayer(ICMP): log_event("ICMP Ping", "Echo Request", src, "ICMP")
+
+# Sniffer Thread
+threading.Thread(target=lambda: sniff(prn=packet_hunter, store=False), daemon=True).start()
+
+# ---------------- ROUTES ----------------
+@app.route('/')
+def index():
+    if 'user' not in session: return redirect('/login')
+    with sqlite3.connect(DB_PATH) as conn:
+        logs = conn.execute("SELECT * FROM alerts ORDER BY time DESC LIMIT 15").fetchall()
+    return render_template_string(DASHBOARD_HTML, logs=logs, email=target_email)
+
+@app.route('/api/stats')
+def stats():
+    with sqlite3.connect(DB_PATH) as conn:
+        data = dict(conn.execute("SELECT protocol, COUNT(*) FROM alerts GROUP BY protocol").fetchall())
+    return jsonify(data)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST' and request.form['u'] == "admin" and request.form['p'] == "admin123":
+        session['user'] = "admin"; return redirect('/')
+    return render_template_string(LOGIN_HTML)
+
+@app.route('/set_email', methods=['POST'])
+def set_email():
+    global target_email
+    target_email = request.form.get('email')
+    return redirect('/')
+
+@app.route('/export/<fmt>')
+def export(fmt):
+    with sqlite3.connect(DB_PATH) as conn:
+        data = conn.execute("SELECT time, type, ip, country, severity FROM alerts").fetchall()
+    path = f"report.{fmt}"
+    if fmt == 'csv':
+        with open(path, 'w') as f: csv.writer(f).writerows([["Time","Type","IP","Loc","Severity"]]+list(data))
+    else:
+        doc = SimpleDocTemplate(path, pagesize=letter)
+        t = Table([["Time","Type","IP","Loc","Severity"]]+[list(x) for x in data])
+        t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.black),('TEXTCOLOR',(0,0),(-1,0),colors.white),('GRID',(0,0),(-1,-1),0.5,colors.grey)]))
+        doc.build([Paragraph("HexaShield Audit Report", getSampleStyleSheet()['Title']), t])
+    return send_file(path, as_attachment=True)
+
+@app.route('/logout')
+def logout(): session.clear(); return redirect('/login')
+
+# ---------------- UI DESIGN ----------------
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <title>HexaShield SIEM</title>
+</head>
+<body class="bg-[#05080a] text-slate-300 p-6 font-sans">
+    <div class="max-w-7xl mx-auto">
+        <header class="flex justify-between items-center mb-8 bg-slate-900/60 p-5 rounded-3xl border border-white/5 shadow-2xl">
+            <div class="flex items-center gap-4">
+                <div class="bg-cyan-500 text-black p-3 rounded-xl shadow-[0_0_20px_rgba(6,182,212,0.4)]"><i class="fas fa-user-shield text-xl"></i></div>
+                <h1 class="text-2xl font-black tracking-tighter text-white">HEXASHIELD <span class="text-cyan-400 font-normal">SIEM</span></h1>
+            </div>
+            <div class="flex gap-4">
+                <form action="/set_email" method="POST" class="flex bg-black/40 p-1 rounded-xl border border-white/10">
+                    <input name="email" value="{{email}}" placeholder="Target Alert Email" class="bg-transparent px-4 py-1 text-xs outline-none w-48 text-white">
+                    <button class="bg-cyan-600 px-4 py-1 rounded-lg text-xs font-bold hover:bg-cyan-500 transition">SAVE</button>
+                </form>
+                <a href="/logout" class="bg-red-500/10 text-red-500 p-2 rounded-xl border border-red-500/20 hover:bg-red-500 hover:text-white transition px-4 text-xs font-bold flex items-center tracking-widest uppercase">Logout</a>
+            </div>
+        </header>
+
+        <div class="grid grid-cols-12 gap-8">
+            <div class="col-span-12 lg:col-span-4 space-y-6">
+                <div class="bg-slate-900/40 p-8 rounded-[2.5rem] border border-white/5 shadow-2xl relative overflow-hidden">
+                    <h2 class="text-[11px] font-black text-slate-500 uppercase mb-8 tracking-[0.3em]">Traffic Distribution</h2>
+                    <canvas id="liveChart" height="280"></canvas>
+                </div>
+               
+                <div class="bg-slate-900/40 p-6 rounded-[2rem] border border-white/5">
+                    <h3 class="text-[10px] font-black text-slate-500 uppercase mb-4 tracking-widest">Incident Export</h3>
+                    <div class="grid grid-cols-2 gap-4">
+                        <a href="/export/pdf" class="bg-white/5 p-4 rounded-2xl text-center hover:bg-cyan-500 hover:text-black transition border border-white/5 font-bold text-xs">PDF Report</a>
+                        <a href="/export/csv" class="bg-white/5 p-4 rounded-2xl text-center hover:bg-cyan-500 hover:text-black transition border border-white/5 font-bold text-xs">CSV Data</a>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-span-12 lg:col-span-8 bg-slate-900/40 rounded-[2.5rem] border border-white/5 overflow-hidden shadow-2xl">
+                <div class="p-6 bg-white/5 flex justify-between items-center border-b border-white/5">
+                    <h2 class="font-black text-xs tracking-widest text-white uppercase italic">Malicious Activity Log</h2>
+                    <div class="flex items-center gap-2"><span class="w-2 h-2 bg-green-500 rounded-full animate-ping"></span><span class="text-[10px] text-green-400 font-bold tracking-widest uppercase">Monitoring Live</span></div>
+                </div>
+                <div class="overflow-x-auto h-[550px]">
+                    <table class="w-full text-left">
+                        <thead class="bg-black/40 text-[10px] uppercase text-slate-500">
+                            <tr><th class="p-5">Vector</th><th class="p-5">Origin IP</th><th class="p-5">Location</th><th class="p-5 text-right">Severity</th></tr>
+                        </thead>
+                        <tbody class="divide-y divide-white/5">
+                            {% for l in logs %}
+                            <tr class="hover:bg-cyan-500/5 transition">
+                                <td class="p-5"><div class="text-xs font-bold text-white uppercase tracking-tighter">{{l[2]}}</div><div class="text-[9px] text-slate-500 font-mono">{{l[1]}}</div></td>
+                                <td class="p-5 text-xs font-mono text-cyan-400">{{l[4]}}</td>
+                                <td class="p-5 text-xs text-slate-400 font-bold"><i class="fas fa-location-dot text-red-500/50 mr-2"></i>{{l[5]}}</td>
+                                <td class="p-5 text-right"><span class="px-3 py-1 rounded-lg text-[9px] font-black {{'bg-red-500/20 text-red-500 border border-red-500/30' if l[6] == 'HIGH' else 'bg-orange-500/20 text-orange-400 border border-orange-500/30'}}">{{l[6]}}</span></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('liveChart').getContext('2d');
+        let liveChart = new Chart(ctx, {
+            type: 'doughnut',
+            data: { labels: [], datasets: [{ data: [], backgroundColor: ['#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899'], borderWidth: 0 }] },
+            options: { cutout: '75%', plugins: { legend: { position: 'bottom', labels: { color: '#64748b', font: { size: 10, weight: 'bold' }, padding: 20 } } } }
+        });
+
+        async function updateData() {
+            try {
+                const r = await fetch('/api/stats');
+                const d = await r.json();
+                liveChart.data.labels = Object.keys(d);
+                liveChart.data.datasets[0].data = Object.values(d);
+                liveChart.update();
+            } catch (e) {}
+        }
+        setInterval(updateData, 3000);
+        updateData();
+    </script>
+</body>
+</html>
+"""
+
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html>
+<head><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-[#05080a] flex items-center justify-center h-screen">
+    <div class="bg-slate-900 p-12 rounded-[3rem] border border-white/5 w-96 shadow-2xl text-center">
+        <h2 class="text-white text-3xl font-black italic mb-2 tracking-tighter">HEXASHIELD</h2>
+        <p class="text-[9px] text-slate-600 tracking-[0.4em] uppercase mb-10">Intrusion Detection Portal</p>
+        <form method="POST" class="space-y-4">
+            <input name="u" placeholder="Operator" class="w-full bg-black/50 border border-white/5 p-4 rounded-2xl text-white outline-none focus:border-cyan-500 text-sm">
+            <input name="p" type="password" placeholder="Passcode" class="w-full bg-black/50 border border-white/5 p-4 rounded-2xl text-white outline-none focus:border-cyan-500 text-sm">
+            <button class="w-full bg-cyan-600 p-4 rounded-2xl font-black text-white hover:bg-cyan-500 transition shadow-lg shadow-cyan-900/30">AUTHORIZE</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
